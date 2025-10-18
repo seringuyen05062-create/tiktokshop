@@ -16,55 +16,69 @@ export class TikTokScraper {
 
   // Khởi tạo browser với proxy nếu có
   private async initBrowser(proxy?: Proxy): Promise<Browser> {
-    const args = chromiumPath.args;
+    let browser: Browser;
+    const baseArgs = [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-accelerated-2d-canvas',
+      '--no-first-run',
+      '--no-zygote',
+      '--single-process',
+      '--disable-gpu',
+      '--disable-web-security',
+      '--disable-features=VizDisplayCompositor',
+      '--headless=new'
+    ];
     
     // Thêm proxy config nếu có
     if (proxy) {
-      args.push(`--proxy-server=${proxy.server}`);
+      baseArgs.push(`--proxy-server=${proxy.server}`);
       this.currentProxy = proxy;
     }
 
-    let browser: Browser;
-    
     try {
-      // Try to use @sparticuz/chromium first (for production/serverless)
+      // Try @sparticuz/chromium first (production/serverless)
+      const executablePath = await chromiumPath.executablePath();
+      const args = [...chromiumPath.args, ...baseArgs];
+      
       browser = await chromium.launch({
         args,
-        executablePath: await chromiumPath.executablePath(),
+        executablePath,
         headless: true,
       });
       
       await addLog({
         timestamp: formatDate(),
         level: 'info',
-        message: 'Browser launched with @sparticuz/chromium',
+        message: '✅ Browser launched with @sparticuz/chromium',
       });
     } catch (error) {
-      // Fallback to local browser in development
       await addLog({
         timestamp: formatDate(),
         level: 'warn',
-        message: `@sparticuz/chromium failed: ${error instanceof Error ? error.message : 'Unknown error'}. Trying local browser...`,
+        message: `@sparticuz/chromium failed: ${error instanceof Error ? error.message : 'Unknown'}. Trying local Chromium...`,
       });
       
       try {
+        // Fallback to local Chromium
         browser = await chromium.launch({
-          args,
+          args: baseArgs,
           headless: true,
         });
         
         await addLog({
           timestamp: formatDate(),
           level: 'info',
-          message: 'Browser launched with local chromium',
+          message: '✅ Browser launched with local Chromium',
         });
       } catch (localError) {
         await addLog({
           timestamp: formatDate(),
           level: 'error',
-          message: `All browser launch attempts failed: ${localError instanceof Error ? localError.message : 'Unknown error'}`,
+          message: `❌ All browser launch failed: ${localError instanceof Error ? localError.message : 'Unknown'}`,
         });
-        throw new Error('Cannot launch browser - please install Chrome/Chromium or check @sparticuz/chromium setup');
+        throw new Error('Browser launch failed - install Chrome/Chromium or check configuration');
       }
     }
 
@@ -664,45 +678,113 @@ export class TikTokScraper {
           throw new Error('Failed to pass captcha');
         }
 
-        // Extract shop info
-        const shopName = await page.$eval('h1, .shop-name, [data-testid="shop-name"]', el => el.textContent?.trim() || '').catch(() => `TikTok Shop ${shopId}`);
+        // Wait for page to load and handle dynamic content
+        await page.waitForTimeout(3000);
+        
+        // Try to detect and extract shop info with multiple selectors
+        const shopName = await page.evaluate(() => {
+          const selectors = [
+            'h1[data-e2e="shop-name"]',
+            '.shop-header-info h1', 
+            '[data-testid="shop-name"]',
+            '.shop-name',
+            'h1',
+            '.header-info h1',
+            '.shop-title'
+          ];
+          
+          for (const selector of selectors) {
+            const el = document.querySelector(selector);
+            if (el && el.textContent?.trim()) {
+              return el.textContent.trim();
+            }
+          }
+          return null;
+        }) || `TikTok Shop ${shopId}`;
 
-        // Extract products
+        // Extract products với improved selectors
         const products: Product[] = [];
         let pageNum = 1;
         let hasNextPage = true;
 
+        await addLog({
+          timestamp: formatDate(),
+          level: 'info',
+          message: `Extracting products from shop: ${shopName}`,
+        });
+
         while (hasNextPage && products.length < 200) { // Giới hạn 200 sản phẩm/shop
           await this.delay();
           
+          // Wait for products to load (dynamic content)
+          await page.waitForFunction(() => {
+            const products = document.querySelectorAll('[data-e2e="product-card"], [data-testid="product-item"], .product-card, .goods-card, .product-item');
+            return products.length > 0;
+          }, { timeout: 10000 }).catch(() => {
+            // Continue if no products found
+          });
+          
           // Extract products from current page
           const pageProducts = await page.evaluate(() => {
-            const productElements = document.querySelectorAll('[data-testid="product-item"], .product-card, .goods-card');
+            const productSelectors = [
+              '[data-e2e="product-card"]',
+              '[data-testid="product-item"]', 
+              '.product-card',
+              '.goods-card',
+              '.product-item',
+              '.goods-item'
+            ];
+            
+            let productElements: NodeListOf<Element> | null = null;
+            
+            for (const selector of productSelectors) {
+              const elements = document.querySelectorAll(selector);
+              if (elements.length > 0) {
+                productElements = elements;
+                break;
+              }
+            }
+            
+            if (!productElements) return [];
+            
             const products = [];
 
             for (let i = 0; i < productElements.length; i++) {
               const el = productElements[i];
               try {
-                const titleEl = el.querySelector('h3, .product-title, .goods-title');
-                const priceEl = el.querySelector('.price, .current-price');
-                const oldPriceEl = el.querySelector('.old-price, .original-price');
-                const soldEl = el.querySelector('.sold, .sales-count');
-                const ratingEl = el.querySelector('.rating, .star-rating');
-                const stockEl = el.querySelector('.stock, .inventory');
-                const linkEl = el.querySelector('a');
+                // Enhanced selectors for TikTok Shop
+                const titleEl = el.querySelector('h3, .product-title, .goods-title, [data-e2e="product-title"], .title');
+                const priceEl = el.querySelector('.price, .current-price, [data-e2e="product-price"], .price-current');
+                const oldPriceEl = el.querySelector('.old-price, .original-price, .price-original, .price-before');
+                const soldEl = el.querySelector('.sold, .sales-count, [data-e2e="product-sold"], .sold-count');
+                const ratingEl = el.querySelector('.rating, .star-rating, .rate, [data-e2e="product-rating"]');
+                const stockEl = el.querySelector('.stock, .inventory, .in-stock');
+                const linkEl = el.querySelector('a[href*="/product/"], a[href*="item_id"], a');
                 const imgEl = el.querySelector('img');
 
                 if (!titleEl || !linkEl) continue;
 
+                // Parse sold count with better regex
+                let soldCount = 0;
+                if (soldEl) {
+                  const soldText = soldEl.textContent || '';
+                  const soldMatch = soldText.match(/(\d+(?:\.\d+)?)\s*[kKmM]?/) || soldText.match(/(\d+)/);
+                  if (soldMatch) {
+                    soldCount = parseFloat(soldMatch[1]);
+                    if (soldText.toLowerCase().includes('k')) soldCount *= 1000;
+                    if (soldText.toLowerCase().includes('m')) soldCount *= 1000000;
+                  }
+                }
+
                 products.push({
                   title: titleEl.textContent?.trim() || '',
-                  product_url: linkEl.href || '',
+                  product_url: (linkEl as HTMLAnchorElement)?.href || '',
                   price_current: priceEl ? parseFloat(priceEl.textContent?.replace(/[^0-9.]/g, '') || '0') : undefined,
                   price_before_discount: oldPriceEl ? parseFloat(oldPriceEl.textContent?.replace(/[^0-9.]/g, '') || '0') : undefined,
-                  sold: soldEl ? parseInt(soldEl.textContent?.replace(/[^0-9]/g, '') || '0') : 0,
+                  sold: soldCount,
                   rating: ratingEl ? parseFloat(ratingEl.textContent?.replace(/[^0-9.]/g, '') || '0') : undefined,
                   stock: stockEl ? parseInt(stockEl.textContent?.replace(/[^0-9]/g, '') || '0') : undefined,
-                  thumbnail_url: imgEl?.src || imgEl?.getAttribute('data-src') || undefined,
+                  thumbnail_url: (imgEl as HTMLImageElement)?.src || (imgEl as HTMLImageElement)?.getAttribute('data-src') || undefined,
                 });
               } catch (error) {
                 console.error('Error extracting product:', error);
@@ -740,14 +822,79 @@ export class TikTokScraper {
             await saveProduct(product);
           }
 
-          // Check for next page
-          const nextButton = await page.$('.pagination-next, .next-page, [aria-label="Next"]').catch(() => null);
+          await addLog({
+            timestamp: formatDate(),
+            level: 'info',
+            message: `Page ${pageNum}: Found ${pageProducts.length} products`,
+          });
+
+          // Try scrolling to load more content (infinite scroll)
+          await page.evaluate(() => {
+            window.scrollTo(0, document.body.scrollHeight);
+          });
+          await page.waitForTimeout(2000);
+
+          // Check for next page or load more button
+          const nextButton = await page.$('.pagination-next, .next-page, [aria-label="Next"], .load-more, [data-e2e="load-more"]').catch(() => null);
+          
           if (nextButton) {
-            await nextButton.click();
-            await page.waitForLoadState('networkidle');
-            pageNum++;
+            try {
+              await nextButton.click();
+              await page.waitForLoadState('networkidle', { timeout: 10000 });
+              pageNum++;
+              
+              await addLog({
+                timestamp: formatDate(),
+                level: 'info',
+                message: `Moving to page ${pageNum}`,
+              });
+            } catch (error) {
+              await addLog({
+                timestamp: formatDate(),
+                level: 'warn',
+                message: `Failed to load next page: ${error instanceof Error ? error.message : 'Unknown'}`,
+              });
+              hasNextPage = false;
+            }
           } else {
-            hasNextPage = false;
+            // Try alternative pagination approaches
+            const currentProductCount = products.length;
+            
+            // Scroll to bottom and wait for new content
+            for (let i = 0; i < 3; i++) {
+              await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+              await page.waitForTimeout(2000);
+            }
+            
+            // Check if new products loaded after scrolling
+            const newPageProducts = await page.evaluate(() => {
+              const productSelectors = [
+                '[data-e2e="product-card"]',
+                '[data-testid="product-item"]', 
+                '.product-card',
+                '.goods-card',
+                '.product-item'
+              ];
+              
+              for (const selector of productSelectors) {
+                const elements = document.querySelectorAll(selector);
+                if (elements.length > 0) {
+                  return elements.length;
+                }
+              }
+              return 0;
+            });
+            
+            // If no new products after scrolling, we're done
+            if (newPageProducts <= pageProducts.length || pageProducts.length === 0) {
+              hasNextPage = false;
+              
+              await addLog({
+                timestamp: formatDate(),
+                level: 'info',
+                message: `No more products found. Total extracted: ${products.length}`,
+              });
+            }
           }
         }
 
